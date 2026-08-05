@@ -2,7 +2,9 @@
 
 ## Project Description
 
-This is the backend deposit-listening service for **Resolva**, a real-time Stellar deposit-tracking platform. Built with NestJS, it connects to the Stellar Horizon API and streams incoming payments across a pool of platform-controlled wallets, attributes each deposit to a user via the transaction memo, and durably records it in Supabase. Non-USDC deposits are then silently swapped to USDC on the Aquarius AMM so user balances settle in a single asset.
+This is the backend deposit-listening service for **Resolva**, a real-time Stellar deposit-tracking platform. Built with NestJS, it connects to the Stellar Horizon API and streams incoming payments across a pool of platform-controlled wallets, attributes each deposit to a user via the transaction memo, and durably records it in Supabase. 
+
+### Non-USDC deposits are then silently swapped to USDC on the Aquarius AMM so user balances settle in a single asset.
 
 The service is designed to run continuously (e.g. on a free-tier host) as a long-lived stream consumer rather than a request/response API — its only HTTP surface is a health-check endpoint used both for uptime monitoring and its own keep-alive cron job.
 
