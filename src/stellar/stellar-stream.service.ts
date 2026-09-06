@@ -38,10 +38,17 @@ export class StellarStreamService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit(): Promise<void> {
-    this.logger.log(
-      `Booting deposit streams for ${this.wallets.length} platform wallet(s)`,
+    this.logger.log(`Booting deposit streams for ${this.wallets.length} platform wallet(s)`);
+    await Promise.all(
+      this.wallets.map((wallet) =>
+        this.startStream(wallet).catch((error: unknown) => {
+          this.logger.error(
+            `Could not start stream for ${wallet}: ${this.describeError(error)}. Retrying.`,
+          );
+          this.scheduleReconnect(wallet);
+        }),
+      ),
     );
-    await Promise.all(this.wallets.map((wallet) => this.startStream(wallet)));
   }
 
   onModuleDestroy(): void {
@@ -107,79 +114,90 @@ export class StellarStreamService implements OnModuleInit, OnModuleDestroy {
     record: PaymentRecord,
   ): Promise<void> {
     try {
-      // We only care about inbound "payment" operations credited to this wallet.
       if (record.type !== 'payment' || record.to !== wallet) {
         await this.saveCursor(wallet, record.paging_token);
         return;
       }
 
       const tx: TransactionRecord = await record.transaction();
-      if ((tx.memo_type !== 'id' && tx.memo_type !== 'text') || !tx.memo) {
-        this.logger.warn(
-          `Skipping op ${record.id} on ${wallet}: missing valid MEMO (must be id or text)`,
-        );
-        await this.saveCursor(wallet, record.paging_token);
-        return;
-      }
-
-      const memoId = tx.memo;
-
-      const { data: profile, error: profileError } = await this.supabase.client
-        .from('profiles')
-        .select('id')
-        .eq('assigned_wallet', wallet)
-        .eq('memo_id', memoId)
-        .maybeSingle<{ id: string }>();
-
-      if (profileError) {
-        this.logger.error(
-          `Profile lookup failed for ${wallet}/${memoId}: ${profileError.message}`,
-        );
-        return;
-      }
-
-      if (!profile) {
-        this.logger.warn(
-          `No profile for wallet ${wallet} memo ${memoId} (op ${record.id})`,
-        );
-        await this.saveCursor(wallet, record.paging_token);
-        return;
-      }
+      const memoId =
+        (tx.memo_type === 'id' || tx.memo_type === 'text') && tx.memo
+          ? tx.memo
+          : null;
 
       const assetCode =
-        record.asset_type === 'native'
-          ? 'XLM'
-          : (record.asset_code ?? 'UNKNOWN');
+        record.asset_type === 'native' ? 'XLM' : (record.asset_code ?? 'UNKNOWN');
 
+      // Attempt attribution, but do not gate the write on it.
+      let userId: string | null = null;
+
+      if (memoId) {
+        const { data: profile, error: profileError } = await this.supabase.client
+          .from('profiles')
+          .select('id')
+          .eq('assigned_wallet', wallet)
+          .eq('memo_id', memoId)
+          .maybeSingle<{ id: string }>();
+
+        if (profileError) {
+          // Transient failure. Do not advance the cursor — the event will be
+          // redelivered on reconnect rather than lost.
+          this.logger.error(
+            `Profile lookup failed for ${wallet}/${memoId}: ${profileError.message}`,
+          );
+          return;
+        }
+
+        userId = profile?.id ?? null;
+      }
+
+      const status = userId ? 'confirmed' : 'unattributed';
+
+      // WRITE FIRST. Every inbound payment is recorded whether or not the
+      // memo resolves, so a deposit is never lost to attribution failure.
       const { error: rpcError } = await this.supabase.client.rpc('record_deposit', {
-        p_user_id: profile.id,
+        p_user_id: userId,
         p_operation_id: record.id,
         p_payment_hash: record.transaction_hash,
         p_amount: record.amount,
         p_asset_code: assetCode,
         p_wallet_address: wallet,
         p_memo_id: memoId,
-        p_status: 'confirmed',
+        p_status: status,
         p_paging_token: record.paging_token,
       });
 
       if (rpcError) {
+        // Write failed. Cursor stays put so the event is redelivered.
         this.logger.error(
           `Deposit record failed for op ${record.id}: ${rpcError.message}`,
         );
         return;
       }
 
-      this.logger.log(
-        `Recorded deposit ${record.amount} ${assetCode} -> user ${profile.id} (op ${record.id})`,
-      );
+      // Only now is it safe to advance.
+      await this.saveCursor(wallet, record.paging_token);
 
-      // Trigger silent conversion if not USDC
+      if (userId) {
+        this.logger.log(
+          `Recorded deposit ${record.amount} ${assetCode} -> user ${userId} (op ${record.id})`,
+        );
+      } else {
+        this.logger.warn(
+          `Recorded UNATTRIBUTED deposit ${record.amount} ${assetCode} on ${wallet} ` +
+            `(op ${record.id}, memo ${memoId ?? 'none'}). Flagged for manual review.`,
+        );
+      }
+
+      // Treasury conversion runs regardless of attribution — the position
+      // needs cleaning either way.
       if (assetCode !== 'USDC') {
-        this.logger.log(`Initiating silent conversion of ${record.amount} ${assetCode} to USDC via Aquarius...`);
-        void this.performSilentConversion(wallet, assetCode, record.amount).catch(err => {
-          this.logger.error(`Silent conversion failed for ${wallet}: ${this.describeError(err)}`);
-        });
+        void this.performSilentConversion(wallet, assetCode, record.amount).catch(
+          (err) =>
+            this.logger.error(
+              `Silent conversion failed for ${wallet}: ${this.describeError(err)}`,
+            ),
+        );
       }
     } catch (error: unknown) {
       this.logger.error(
@@ -231,12 +249,16 @@ export class StellarStreamService implements OnModuleInit, OnModuleDestroy {
       .maybeSingle<{ cursor: string }>();
 
     if (error) {
+      // Do NOT fall back to "now" — that silently discards every deposit
+      // that arrived while the datastore was unreachable. Fail loudly and
+      // let the reconnect logic retry the read.
       this.logger.error(
-        `Could not load cursor for ${wallet}: ${error.message}. Falling back to "now".`,
+        `Could not load cursor for ${wallet}: ${error.message}. Refusing to start stream.`,
       );
-      return 'now';
+      throw new Error(`Cursor read failed for ${wallet}: ${error.message}`);
     }
 
+    // A missing row is the legitimate first-run case, not an error.
     return data?.cursor ?? 'now';
   }
 
